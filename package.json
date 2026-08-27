@@ -1,0 +1,45 @@
+{
+  "name": "@telemai/pi-telem",
+  "version": "0.2.5",
+  "description": "Telem web search and web fetch for the pi coding agent (extension + skill)",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "telem",
+    "web-search",
+    "search",
+    "fetch",
+    "extension",
+    "skill"
+  ],
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "LICENSE",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/extensions/telem/index.js"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "build": "esbuild extensions/telem/index.ts --bundle --platform=node --format=esm --external:typebox --external:@earendil-works/pi-coding-agent --outfile=dist/extensions/telem/index.js --minify-whitespace --minify-syntax --legal-comments=none",
+    "prepack": "npm run build",
+    "test": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "typebox": "1.3.7"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
