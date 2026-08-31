@@ -678,6 +678,282 @@ function formatFetchResults(interaction: any): string {
 }
 
 // ---------------------------------------------------------------------------
+// Incremental history, phase 1: an ancestor's context travels ONCE per snapshot.
+// Today the same flattened ancestor history is re-sent byte-identically on every
+// single call — 82% of this client's wire — and the backend is first-writer-wins
+// on node content, so every re-send after the first is already a no-op.
+//
+// What makes dropping it safe is PROOF, not byte counting. An ancestor node
+// whose FIRST arrival carries no context is stored with a null context frozen
+// forever — unrepairable in the Telem backend and in obs, and it empties the conversation
+// title of a purely-delegating root. So context is omitted only for a snapshot
+// this process has PROVEN delivered and only to a backend that has
+// PROVEN it implements the guard. Both proofs are per
+// (baseUrl, key) scope, because node ids are derived from the account key
+// server-side: flip either and every belief about that world is void.
+//
+// LIFETIME — mutable module state, joining the config parse cache and the
+// notice sink near the top of the file, and it is
+// module state on purpose. The extension module is evaluated once per pi
+// extension host process; the tools it registers outlive every individual
+// session and every individual tool call, and so must the proofs (a belief
+// earned by one search is what the next search omits on). It is the same scope
+// the config parse cache and the notice sink at the top of this file already
+// use. Nothing survives the process: after a restart every proof is re-earned
+// from the first response, and until then nothing is omitted — the safe
+// direction, which is also the cost of every miss below (one full re-send).
+// ---------------------------------------------------------------------------
+
+// Snapshot keys are one-way hashes that can never be mapped back to a session,
+// so idle-eviction is impossible and the cache is bounded by count alone
+// An eviction costs one redundant full re-send — the safe direction.
+const DELIVERED_CAP = 4096
+// A process sees one or two scopes in its life. Bounded anyway; forgetting a
+// capability just re-learns it from the next response, and until then nothing is
+// omitted — again the safe direction.
+const CAPABILITY_CAP = 64
+
+// Insertion-ordered LRU set: re-adding refreshes recency, and the oldest key is
+// the first one `keys` yields.
+function createLruSet(cap: number) {
+  const entries = new Map<string, true>()
+  return {
+    has: (key: string): boolean => entries.has(key),
+    add(key: string): void {
+      entries.delete(key)
+      entries.set(key, true)
+      while (entries.size > cap) {
+        const oldest = entries.keys().next().value
+        if (oldest === undefined) break
+        entries.delete(oldest)
+      }
+    },
+    remove(key: string): void {
+      entries.delete(key)
+    },
+  }
+}
+
+// The cache scope. The API key is HASHED here and nowhere held or logged raw —
+// this string ends up as a Map key, not on the wire and not in a warning.
+function cacheScope(baseUrl: string, apiKey?: string): string {
+  return baseUrl + " " + sha256hex(apiKey ?? "")
+}
+
+// One flat cache keyed by scope AND snapshot, so the LRU bound is a true total
+// and a scope flip simply misses instead of needing its own eviction policy.
+// NUL is not producible by either component (a uuid and a hashed url+key).
+function deliveredKey(scope: string, snapshotKey: string): string {
+  return scope + "\u0000" + snapshotKey
+}
+
+// Phase 1 is ON by default (owner decision, 2026-08-26). Read per CALL, like the
+// rest of the config: flipping it takes effect on the next tool call.
+//
+//   ancestors | (unset)  phase 1: an ancestor's context once per snapshot
+//   off                  the pre-phase-1 wire — the kill switch
+//
+// On by default is safe because the mode is only HALF the gate. Omitting an
+// ancestor context ALSO requires the server-capability probe: this exact
+// (baseUrl, key) scope must already have answered with a `missing_snapshots`
+// key, which only a backend carrying the guard emits. Against an old or
+// third-party backend the probe never fires, so the extension keeps sending full
+// contexts — byte-identical to the pre-wave extension — and the default can
+// never strand a node whose context nobody stored. `off` short-circuits the mode
+// half and remains the instant, no-deploy rollback lever the Telem backend's one-way-door
+// checklist depends on.
+//
+// Phase 2 (the history delta, spec) is NOT implemented in this extension, so
+// `history` is not a mode here — it resolves to the default like any other
+// unrecognized value. That fallback is deliberate: the rollback lever is the
+// exact word `off` (after trim + lowercase) and nothing else, so an operator
+// reaching for it should verify the value that landed, not the intent.
+// TELEM_INCREMENTAL_FORCE is not a second mode — it is the differential
+// harness's test-only bypass of the capability probe, never production.
+function incrementalMode(): string {
+  const raw = (process.env.TELEM_INCREMENTAL ?? "").trim().toLowerCase()
+  return raw === "off" ? "off" : "ancestors"
+}
+
+// One ancestor entry this call chose not to send the context for. The `entry`
+// is the very object inside `metadata.ancestors`, so restoring is a swap on the
+// body that is about to be re-serialized — same node_key, same everything else.
+type OmittedContext = { key: string; entry: Record<string, unknown>; context: HistoryMessage[] }
+
+// Filled in by buildTrajectory: the scope this POST will use, plus — only once
+// the ancestor list is final — the snapshot keys the request carries FULL
+// context for. That is exactly the set a 2xx proves delivered. Bookkeeping that
+// throws leaves the lists empty, so a degraded call can never mark a delivery
+// that never went out, and can never take the retry path either.
+type DeliveryPlan = {
+  scope: string
+  sentWithContext: string[]
+  // The other half of the same ledger: what this request WITHHELD. Kept whole —
+  // key, the entry object as it rides in the body, and the context that was
+  // materialized this call and merely not sent — because the guard's 409 asks
+  // for exactly this back. Empty is also the gate: a 409 on a request
+  // that omitted nothing is a plain error, never a retry.
+  omitted: OmittedContext[]
+}
+
+// Phase-1 belief, per host process (see LIFETIME above): `delivered` holds
+// (scope, snapshot) pairs whose context is proven landed, `capability` the
+// scopes whose backend implements the guard.
+const delivered = createLruSet(DELIVERED_CAP)
+const capability = createLruSet(CAPABILITY_CAP)
+
+// Does THIS call omit context for snapshots already delivered to `scope`?
+// Production waits for the server's own capability signal; the differential
+// harness (and only it) forces the answer, its cache being correct by
+// construction.
+function omitsDeliveredContext(scope: string): boolean {
+  if (incrementalMode() !== "ancestors") return false
+  if (process.env.TELEM_INCREMENTAL_FORCE === "1") return true
+  return capability.has(scope)
+}
+
+// Called only after a response came back ok AND its body parsed. Never at send
+// time: a parallel sibling would otherwise omit on the strength of a request
+// that can still fail before the backend's Phase B commits — which is exactly
+// how a permanently context-less node is born.
+//
+// Marking runs even when the mode is off. Passive learning costs nothing, is
+// never acted on while off, and means flipping the mode on does not need a
+// warm-up call to re-earn what this process already proved.
+function recordDelivery(delivery: DeliveryPlan, body: unknown): void {
+  const scope = delivery.scope
+  for (const key of delivery.sentWithContext) delivered.add(deliveredKey(scope, key))
+  if (!body || typeof body !== "object") return
+  // KEY PRESENCE, never truthiness — the healthy value is `[]`. A
+  // backend without the guard omits the key entirely and so never grants
+  // capability, which is what keeps an omitting client off an old server.
+  if (!(MISSING_SNAPSHOTS in (body as Record<string, unknown>))) return
+  capability.add(scope)
+  // Reported keys are nodes the backend REFUSED to create: un-mark them so the
+  // next call carries their full context again.
+  const missing = (body as Record<string, unknown>)[MISSING_SNAPSHOTS]
+  if (Array.isArray(missing)) {
+    for (const key of missing) delivered.remove(deliveredKey(scope, String(key)))
+  }
+}
+
+// Put every withheld context back into the body this call already built.
+//
+// Un-marking comes FIRST and is not conditional on the retry succeeding: the
+// 409 falsified this process's belief that those rows exist, and a sibling
+// building its body right now must carry their contexts too. A retry that then
+// fails leaves them unmarked, which is the safe direction — one redundant full
+// re-send.
+//
+// The keys move to `sentWithContext`, so the retry's 2xx marks exactly what the
+// retry actually carried, through the same recordDelivery as any call.
+function restoreOmittedContexts(delivery: DeliveryPlan): void {
+  for (const { key, entry, context } of delivery.omitted) {
+    delivered.remove(deliveredKey(delivery.scope, key))
+    delete entry.context_omitted
+    entry.context = context
+    delivery.sentWithContext.push(key)
+  }
+  delivery.omitted = []
+}
+
+// ---------------------------------------------------------------------------
+// The guard's refusal. When an omitted snapshot's row is
+// missing, the backend refuses the whole request with HTTP 409 BEFORE any
+// provider runs, before billing, before an interaction row exists — the Phase B
+// transaction rolls back whole, so nothing of the request persisted. The client
+// answers by restoring the withheld contexts and re-sending once.
+// ---------------------------------------------------------------------------
+
+const MISSING_SNAPSHOTS = "missing_snapshots"
+
+// One POST, with the error body read HERE: the 409 discriminator and the text
+// the tool error carries are the same bytes, and a Response body can only be
+// consumed once.
+async function postOnce(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  signal: any,
+): Promise<{ response: Response; detail: string }> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  })
+  const detail = response.ok ? "" : await response.text().catch(() => "")
+  return { response, detail }
+}
+
+// The typed code, from either envelope the two doors use: FastAPI's `detail` on
+// /v1/interactions, the `{"error": {...}}` envelope on /v1/fetch. The
+// bare top-level read is pure defense — a proxy that unwraps, a future door that
+// does not wrap. Undefined means "this body names no code we can read", which
+// includes a body that is not JSON at all.
+function refusalCode(detail: string): string | undefined {
+  let body: any
+  try {
+    body = JSON.parse(detail)
+  } catch {
+    return undefined
+  }
+  for (const shape of [body?.detail, body?.error, body]) {
+    const code = shape && typeof shape === "object" ? shape.code : undefined
+    if (typeof code === "string" && code) return code
+  }
+  return undefined
+}
+
+// Is this 409 the guard asking for the contexts back?
+//
+// Two judgement calls, both deliberate, because a defensive parse has to decide
+// what an ambiguous body means:
+//
+//   - NO code readable (unparseable body, a proxy's plain-text 409, an envelope
+//     shape we do not know) => TREAT IT AS THE REFUSAL. The retry is a standard
+//     full request re-sending the same node_keys, so a wrong guess costs one
+//     round trip; guessing the other way costs the user a failed tool call on
+//     the one condition this whole path exists to heal.
+//   - A code that is present and is NOT `missing_snapshots` => NOT the refusal.
+//     The server named a different reason; restoring contexts cannot address it,
+//     and re-POSTing a request it just refused for a stated reason is a blind
+//     retry of a non-idempotent call. Surface it.
+//
+// And the gate above both: the request must have omitted something. A 409 on a
+// request that withheld nothing is somebody else's error.
+function isMissingSnapshotsRefusal(status: number, detail: string, plan: DeliveryPlan): boolean {
+  if (status !== 409 || !plan.omitted.length) return false
+  const code = refusalCode(detail)
+  return code === undefined || code === MISSING_SNAPSHOTS
+}
+
+// The POST, plus the single in-call retry the guard's 409 asks for.
+//
+// The retried body is the SAME body object — same node_keys, same
+// message_history, same search block — with `context_omitted` swapped back for
+// `context`. The search therefore still runs exactly once: the 409 is a
+// PRE-execution refusal that persisted nothing and billed nothing.
+//
+// `signal` is threaded through both attempts: an abort between them aborts the
+// retry, exactly as it would have aborted the first send.
+async function postWithOmissionRetry(
+  url: string,
+  headers: Record<string, string>,
+  body: unknown,
+  delivery: DeliveryPlan,
+  signal: any,
+): Promise<{ response: Response; detail: string }> {
+  const first = await postOnce(url, headers, body, signal)
+  if (!isMissingSnapshotsRefusal(first.response.status, first.detail, delivery)) return first
+  restoreOmittedContexts(delivery)
+  // Exactly once. `omitted` is now empty, so a second 409 cannot re-enter this
+  // branch even in principle — it is surfaced as the tool error like any
+  // non-ok, which is the behaviour the guard asks for.
+  return await postOnce(url, headers, body, signal)
+}
+
+// ---------------------------------------------------------------------------
 // Trajectory assembly. Same wire contract as the opencode plugin, on
 // `body.metadata` alongside `message_history`:
 //   session_key       uuid5 identity of self's context-window generation
@@ -693,15 +969,29 @@ function formatFetchResults(interaction: any): string {
 // best-effort self key with no ancestors.
 // ---------------------------------------------------------------------------
 
-type Lineage = { materialized: boolean; key?: string; entry?: Record<string, unknown> }
+// `withheld` is set only on an entry that omitted: the context this call DID
+// materialize and chose not to send. It is what the guard's 409 asks back for
+// so it is kept rather than recomputed — a second walk could read
+// a session file that moved underneath us and answer a different question.
+type Lineage = {
+  materialized: boolean
+  key?: string
+  entry?: Record<string, unknown>
+  withheld?: HistoryMessage[]
+}
 
 async function buildTrajectory(
   ctx: ExtensionContext,
   entries: any[],
   nodeKey: string,
   kind: string,
+  delivery: DeliveryPlan,
 ): Promise<Record<string, unknown>> {
   const sm: any = ctx.sessionManager
+  // Read ONCE for the whole walk, and against the scope this POST will use
+  // — the mode and the capability probe must not be able to flip
+  // between two ancestors of the same request.
+  const omitDelivered = omitsDeliveredContext(delivery.scope)
   const selfId = String(sm.getSessionId())
   const traj: Record<string, unknown> = {
     session_key: sessionKey(selfId, lastCompactionId(entries), activeBranchRev(sm)),
@@ -768,9 +1058,21 @@ async function buildTrajectory(
       const comp = lastCompactionId(ancestorEntries)
       const spawn = lastAssistantEntry(ancestorEntries)
       const snapKey = snapshotNodeKey(id, spawn?.id ?? NONE)
+      // The entry is unchanged on every key EXCEPT `context`: the
+      // fingerprint still fills the session row per call, and the always-sent
+      // edge set is what keeps v5 self-heal independent of client memory.
+      // `context_omitted` is functional, not decorative — it is the server's
+      // licence to no-op the row rather than freeze a null into it.
+      const omitContext = omitDelivered && delivered.has(deliveredKey(delivery.scope, snapKey))
+      // Materialized on EVERY call, omitting or not. Withholding is a send-time
+      // decision — it materialized them this call and merely withheld them at
+      // send time — which is precisely what makes the retry a swap rather
+      // than a second walk of a session file that may have moved since.
+      const context = flattenEntries(ancestorEntries)
       lineage.push({
         materialized: true,
         key: snapKey,
+        withheld: omitContext ? context : undefined,
         entry: {
           // rev anchored at the spawn entry, not the parent's current leaf —
           // a parent navigated elsewhere after the fork keeps this key stable.
@@ -778,7 +1080,7 @@ async function buildTrajectory(
           fingerprint: fingerprint(id),
           node_key: snapKey,
           parent_node_key: null,
-          context: flattenEntries(ancestorEntries),
+          ...(omitContext ? { context_omitted: true } : { context }),
           // When the spawn actually happened: the spawn message's own harness
           // timestamp — the true delegation moment, not backend row time.
           spawned_at: spawn?.timeMs != null ? new Date(spawn.timeMs).toISOString() : null,
@@ -795,6 +1097,8 @@ async function buildTrajectory(
   lineage.reverse() // root-first
 
   const ancestors: Record<string, unknown>[] = []
+  const sentWithContext: string[] = []
+  const omitted: OmittedContext[] = []
   for (let i = 0; i < lineage.length; i++) {
     const m = lineage[i]
     if (!m.materialized || !m.entry) continue
@@ -802,6 +1106,11 @@ async function buildTrajectory(
     // NULL across a hole; never skip up to a surviving grandparent.
     m.entry.parent_node_key = prev && prev.materialized ? prev.key : null
     ancestors.push(m.entry)
+    // The two halves of the ledger, read off the entry that actually shipped:
+    // what carried context, and what withheld it (with the context kept).
+    if (!m.key) continue
+    if ("context" in m.entry) sentWithContext.push(m.key)
+    else if (m.withheld) omitted.push({ key: m.key, entry: m.entry, context: m.withheld })
   }
   // This node's parent is the DIRECT parent's snapshot specifically. If the
   // direct parent was omitted, NULL — never float to a grandparent (a
@@ -809,6 +1118,11 @@ async function buildTrajectory(
   const direct = lineage[lineage.length - 1]
   traj.parent_node_key = direct && direct.materialized ? direct.key : null
   traj.ancestors = ancestors
+  // Published at the very end, deliberately: anything that throws above leaves
+  // the plan empty, so the call marks nothing — and, with `omitted` empty too, a
+  // degraded call cannot take the retry path either.
+  delivery.sentWithContext = sentWithContext
+  delivery.omitted = omitted
   return traj
 }
 
@@ -818,6 +1132,7 @@ async function buildMetadata(
   ctx: ExtensionContext,
   currentCall: CurrentCall,
   kind: string,
+  delivery: DeliveryPlan,
 ): Promise<Record<string, unknown>> {
   let entries: any[] = []
   try {
@@ -830,8 +1145,15 @@ async function buildMetadata(
   }
   const nodeKey = randomUUID()
   try {
-    Object.assign(metadata, await buildTrajectory(ctx, entries, nodeKey, kind))
+    Object.assign(metadata, await buildTrajectory(ctx, entries, nodeKey, kind, delivery))
   } catch {
+    // The degraded payload carries NO ancestors, so this call sent no context
+    // and withheld none: clear both halves of the ledger rather than inherit a
+    // partial one. (buildTrajectory publishes only on its way out, so this is
+    // belt-and-braces — the belief that matters is "a degraded call proves
+    // nothing and retries nothing".
+    delivery.sentWithContext = []
+    delivery.omitted = []
     let selfId = ""
     try {
       selfId = String((ctx.sessionManager as any).getSessionId())
@@ -918,10 +1240,25 @@ export default function (pi: ExtensionAPI) {
         throw new Error("telem_search requires at least one non-empty query in `queries`.")
       }
 
+      // Resolved HERE, per call: a telem.json edit or a newly exported env var
+      // takes effect on the next search, with no pi restart. It resolves BEFORE
+      // the trajectory is built because the (baseUrl, key) scope
+      // decides which ancestor contexts may be omitted, and that decision has to
+      // be taken against the very scope this POST then uses — resolving
+      // afterwards could omit against one world what was only ever delivered to
+      // another.
+      const config = resolveTelemConfig(ctx.cwd, projectTrusted(ctx))
+      const delivery: DeliveryPlan = {
+        scope: cacheScope(config.baseUrl, config.apiKey),
+        sentWithContext: [],
+        omitted: [],
+      }
+
       const metadata = await buildMetadata(
         ctx,
         { toolCallId, args: params, tool: "telem_search" },
         "search",
+        delivery,
       )
       // goal is an optional best-effort label on this search node (first-wins
       // per node on the backend). Sent whenever the model supplies one.
@@ -932,9 +1269,6 @@ export default function (pi: ExtensionAPI) {
       // runs concurrently as ONE interaction, tagging every run with its batch_index.
       const userInput =
         queries.length === 1 ? { query: queries[0] } : queries.map((query: string) => ({ query }))
-      // Resolved HERE, per call: a telem.json edit or a newly exported env
-      // var takes effect on the next search, with no pi restart.
-      const config = resolveTelemConfig(ctx.cwd, projectTrusted(ctx))
       const body: Record<string, unknown> = {
         user_input: userInput,
         postprocessor_names: [],
@@ -954,17 +1288,31 @@ export default function (pi: ExtensionAPI) {
       // and creates an interaction), so a thrown transient failure is surfaced
       // rather than silently re-run. node_key is nonetheless minted once per
       // call, so any retry added at a safe layer stays a node no-op.
-      const response = await fetch(`${config.baseUrl}/v1/interactions`, {
-        method: "POST",
+      //
+      // The ONE exception is the guard's `missing_snapshots` 409,
+      // and it does not weaken that stance: it is a PRE-EXECUTION refusal —
+      // nothing ran, nothing billed, nothing persisted — so the retry is this
+      // call's only execution, carrying the same node_keys.
+      const { response, detail } = await postWithOmissionRetry(
+        `${config.baseUrl}/v1/interactions`,
         headers,
-        body: JSON.stringify(body),
+        body,
+        delivery,
         signal,
-      })
+      )
       if (!response.ok) {
-        const detail = await response.text().catch(() => "")
         throw new Error(`Telem search failed: HTTP ${response.status} ${detail.slice(0, 200)}`)
       }
       const interaction = await response.json()
+      // Delivery is proven HERE: ok plus a body that parsed. A json
+      // throw skips this line, which is the "parse failure marks nothing" rule,
+      // and a non-ok already threw above.
+      //
+      // Deliberately BEFORE the envelope gate: a pre-V2 answer fails the SEARCH
+      // for the model, but it was still a real 2xx interaction whose trajectory
+      // write (Phase B, committed before the search runs) landed — those
+      // ancestor contexts are in the database either way.
+      recordDelivery(delivery, interaction)
       // Refuse a pre-V2 answer before rendering anything (see the gate).
       assertV2Envelope(interaction)
       const sessionId = interaction.session_id ? String(interaction.session_id) : undefined
@@ -1003,14 +1351,28 @@ export default function (pi: ExtensionAPI) {
       // Friendly pre-validation, before any I/O.
       const urls = validateFetchUrls(params.urls)
 
+      // Config first, for the same reason as telem_search: the omission scope
+      // must be the scope this POST uses. The search block is never
+      // attached here, but the base url and key are shared — and they are
+      // exactly what the scope is made of.
+      const config = resolveTelemConfig(ctx.cwd, projectTrusted(ctx))
+      const delivery: DeliveryPlan = {
+        scope: cacheScope(config.baseUrl, config.apiKey),
+        sentWithContext: [],
+        omitted: [],
+      }
+
       // The SAME v5 trajectory payload as telem_search — a fetch is just
       // another event node in the session — with kind "fetch" as the declared
       // intent (the backend derives authoritatively from the request shape and
-      // 400s on contradiction). Same degrade stance.
+      // 400s on contradiction). Same degrade stance. A fetch delivers ancestors
+      // through the same handler, so a fetch 2xx is delivery proof and a fetch
+      // may omit exactly like a search: ONE watermark, both tools.
       const metadata = await buildMetadata(
         ctx,
         { toolCallId, args: params, tool: "telem_fetch" },
         "fetch",
+        delivery,
       )
 
       // The gated contract (fetch spec): user_input carries `urls` and the
@@ -1023,21 +1385,22 @@ export default function (pi: ExtensionAPI) {
         metadata,
       }
 
-      const config = resolveTelemConfig(ctx.cwd, projectTrusted(ctx))
       const headers: Record<string, string> = { "Content-Type": "application/json" }
       if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`
 
-      const response = await fetch(`${config.baseUrl}/v1/fetch`, {
-        method: "POST",
+      const { response, detail } = await postWithOmissionRetry(
+        `${config.baseUrl}/v1/fetch`,
         headers,
-        body: JSON.stringify(body),
+        body,
+        delivery,
         signal,
-      })
+      )
       if (!response.ok) {
-        const detail = await response.text().catch(() => "")
         throw new Error(`Telem fetch failed: HTTP ${response.status} ${detail.slice(0, 200)}`)
       }
       const interaction = await response.json()
+      // Proven here, same rule as telem_search: ok, and a body that parsed.
+      recordDelivery(delivery, interaction)
       const sessionId = interaction.session_id ? String(interaction.session_id) : undefined
       return {
         content: [{ type: "text", text: formatFetchResults(interaction) }],
