@@ -11,6 +11,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 import { createHash, randomUUID } from "node:crypto"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 
 // The unified config contract lives in ONE place for every Telem surface —
 // option table, `.telem` file layer, six-level resolution. It is
@@ -21,10 +23,21 @@ import { createHash, randomUUID } from "node:crypto"
 import {
   createConfigReader,
   createNoticeSink,
+  isBehind,
+  noticeAlreadyShown,
   readCredentials,
   resolveHarnessOptions,
+  resolveTelemDir,
 } from "../../config-core/index.ts"
 import type { TelemOptions } from "../../config-core/index.ts"
+// The injected, package.json-lockstep self-version. The per-surface
+// update command is a hand-inlined LITERAL (PI_UPDATE_COMMAND, below) rather than
+// an import of the shared corpus JSON: the published package ships `dist/` only,
+// not the config-core fixtures, so the JSON cannot be read at runtime — and
+// importing it inlined the whole file (its internal `_note`/`_pending` prose
+// included) into the bundle. A test pins the literal equal to the corpus row, the
+// same anti-drift pattern openclaw and the SDK use.
+import { PLUGIN_VERSION } from "./version.ts"
 
 const HISTORY_TEXT_CAP = 128000 // per-message cap; tool results can embed whole files
 
@@ -74,6 +87,151 @@ type TelemConfig = TelemOptions & { baseUrl: string; apiKey?: string }
 // what it describes changes — together, one warning per EDIT, not per search.
 const readConfigFile = createConfigReader((message: string) => console.warn(message))
 const emitNotices = createNoticeSink((message: string) => console.warn(message))
+
+// ---------------------------------------------------------------------------
+// Client update advisory (spec the design notes
+// On a 2xx search/fetch whose body parsed, the server MAY name the version
+// it recommends for THIS surface. If our injected PLUGIN_VERSION is strictly
+// behind it, we emit a ONE-TIME, OFF-MODEL notice on pi's `console.warn` channel
+// (the same live channel its config warnings use, extensions/telem/index.ts) —
+// never the tool result the model reads. Notify-only: this compares versions and
+// prints a message; it NEVER updates anything.
+//
+// The comparison (`isBehind`) and the cross-run stamp gate (`noticeAlreadyShown`)
+// are shared, drift-pinned pieces imported from config-core as SOURCE; the update
+// command is a hand-inlined literal (PI_UPDATE_COMMAND). Everything below is the
+// thin per-surface SHELL — env opt-out, TTY/CI detection, the stamp file, the
+// clock, the notice — the pi mirror of opencode's T3 (T5).
+//
+// The advisory KEY is a FIXED LITERAL, decoupled from HARNESS_ID:
+// this surface always reads `recommended.pi`, never its trajectory id.
+const ADVISORY_KEY = "pi"
+const UPDATE_STAMP_FILE = "update-notice.json"
+
+// The exact pi update instruction — hand-inlined equal to the shared corpus's
+// `"pi"` row (the shared config contract). It is a LITERAL (not an
+// import of the JSON) because the published bundle ships `dist/` only and cannot
+// read the fixtures at runtime; tests/update-advisory.test.ts pins this `===` that
+// row.
+const PI_UPDATE_COMMAND = "The Telem pi extension can be updated with: pi install npm:@telemai/pi-telem"
+
+// In-process dedup, keyed by the recommended version string: a
+// long-lived pi daemon re-notifies ONCE per server-bumped version, never per
+// call, and a same-version re-run stays silent. Module scope so it outlives
+// calls, joining the config parse cache and the notice sink above.
+const advisoryNotified = new Set<string>()
+
+// The `body.client_advisory?.recommended?.pi` path — silent (undefined) on a
+// null/absent/malformed field, never a throw (spec read step, rule 5).
+function readAdvisoryVersion(body: unknown): string | undefined {
+  if (!body || typeof body !== "object") return undefined
+  const advisory = (body as Record<string, unknown>).client_advisory
+  if (!advisory || typeof advisory !== "object") return undefined
+  const recommended = (advisory as Record<string, unknown>).recommended
+  if (!recommended || typeof recommended !== "object") return undefined
+  const value = (recommended as Record<string, unknown>)[ADVISORY_KEY]
+  return typeof value === "string" ? value : undefined
+}
+
+// Env-only opt-out: `TELEM_NO_UPDATE_NOTICE=1` suppresses
+// entirely. Matches the shipped env-flag rule (`optionFromEnv`: only "1" turns a
+// flag on); trimmed so a stray space does not defeat the lever.
+function updateNoticeOptedOut(): boolean {
+  return (process.env.TELEM_NO_UPDATE_NOTICE ?? "").trim() === "1"
+}
+
+// Non-interactive one-shots (`pi -p`, piped stdin, CI) are a fresh process per
+// call with an empty in-memory dedup — they would notify on EVERY run, and the
+// notice only makes sense in an interactive session anyway. Suppress there (spec
+// re-implemented per surface (create-telemai's copy is not importable).
+function updateNoticeSuppressedByContext(): boolean {
+  return !process.stdin.isTTY || Boolean(process.env.CI)
+}
+
+// Today as a local `YYYY-MM-DD`. The stamp gates "once per day"; a coarse local
+// calendar day is the right granularity and needs no tz dependency.
+function todayStamp(): string {
+  const now = new Date()
+  const y = now.getFullYear()
+  const m = String(now.getMonth() + 1).padStart(2, "0")
+  const d = String(now.getDate()).padStart(2, "0")
+  return `${y}-${m}-${d}`
+}
+
+type UpdateStamp = Record<string, { version?: string; lastShownDate?: string }>
+
+// `~/.telem/update-notice.json`, next to credentials.json and honoring
+// TELEM_CONFIG_DIR (same directory resolution as the credentials file). No
+// projectRoot: "told once per release" is a user-level fact, not a per-repo one.
+function updateStampDir(): string {
+  return resolveTelemDir(process.env).dir
+}
+
+// SILENT by design: a missing / unreadable / malformed stamp is "nothing shown
+// yet", so a lost stamp degrades to show-once — it must never throw
+// into the turn.
+function readUpdateStamp(): UpdateStamp {
+  try {
+    const parsed = JSON.parse(readFileSync(join(updateStampDir(), UPDATE_STAMP_FILE), "utf8"))
+    return parsed && typeof parsed === "object" ? (parsed as UpdateStamp) : {}
+  } catch {
+    return {}
+  }
+}
+
+// Record that this surface showed the notice for `version` on `today`. `mkdir -p`
+// first — an env-only user who never ran create-telemai has no `~/.telem` yet
+// A write failure degrades to "notify again next run", never a throw.
+function writeUpdateStamp(version: string, today: string): void {
+  try {
+    const dir = updateStampDir()
+    mkdirSync(dir, { recursive: true })
+    const stamp = readUpdateStamp()
+    stamp[ADVISORY_KEY] = { version, lastShownDate: today }
+    writeFileSync(join(dir, UPDATE_STAMP_FILE), JSON.stringify(stamp))
+  } catch {
+    /* notify-only: a stamp write must never break a search. */
+  }
+}
+
+// The per-surface SHELL of the update advisory, called right
+// after `recordDelivery` at both post-parse sites. Gates, IN THIS ORDER — each
+// reads from where the comment says — then warns once. Everything is wrapped: a
+// malformed field, an unreadable stamp, all silently no-op (rule 5). It NEVER
+// touches the tool result the model reads — `console.warn` is off-model.
+function maybeNotifyClientUpdate(body: unknown): void {
+  try {
+    // 1. opt-out          ← env (TELEM_NO_UPDATE_NOTICE)
+    if (updateNoticeOptedOut()) return
+    // 2. non-interactive  ← tty/env (process.stdin.isTTY, process.env.CI)
+    if (updateNoticeSuppressedByContext()) return
+    // 3. read the advisory ← the parsed response body (fixed literal key)
+    const recommended = readAdvisoryVersion(body)
+    if (recommended === undefined) return
+    // 4. in-process once  ← module-scope Set, keyed by the version string
+    if (advisoryNotified.has(recommended)) return
+    // 5. behind?          ← shared comparator over the injected PLUGIN_VERSION
+    if (!isBehind(PLUGIN_VERSION, recommended)) return
+    // 6. cross-run stamp  ← fs (~/.telem/update-notice.json) + the local clock
+    const today = todayStamp()
+    const stamp = readUpdateStamp()
+    if (noticeAlreadyShown(stamp[ADVISORY_KEY], recommended, today)) {
+      // Already told on this machine today for this version. Mark the process
+      // so a long-lived daemon does not re-stat the file every call.
+      advisoryNotified.add(recommended)
+      return
+    }
+    // 7. the command      ← inlined literal, pinned to the shared corpus by a test
+    // The OFF-MODEL notice. pi routes its config warnings to `console.warn`, so
+    // the version notice rides the same channel — visible to the user running
+    // pi, invisible to the model (it is not the tool result). One line.
+    console.warn(`A newer Telem pi extension (${recommended}) is available. ${PI_UPDATE_COMMAND}`)
+    advisoryNotified.add(recommended)
+    writeUpdateStamp(recommended, today)
+  } catch {
+    /* malformed/missing everything ⇒ silent, never throw into the turn */
+  }
+}
 
 // `projectRoot` is the session's working directory (ctx.cwd); the cwd is only
 // the fallback, and it can THROW if the directory pi was started in is gone, in
@@ -1313,6 +1471,10 @@ export default function (pi: ExtensionAPI) {
       // write (Phase B, committed before the search runs) landed — those
       // ancestor contexts are in the database either way.
       recordDelivery(delivery, interaction)
+      // Client update advisory: off-model (console.warn), never the
+      // render below. Runs BEFORE the V2 gate for the same reason recordDelivery
+      // does — it is a separate concern from whether this answer renders.
+      maybeNotifyClientUpdate(interaction)
       // Refuse a pre-V2 answer before rendering anything (see the gate).
       assertV2Envelope(interaction)
       const sessionId = interaction.session_id ? String(interaction.session_id) : undefined
@@ -1401,6 +1563,8 @@ export default function (pi: ExtensionAPI) {
       const interaction = await response.json()
       // Proven here, same rule as telem_search: ok, and a body that parsed.
       recordDelivery(delivery, interaction)
+      // Client update advisory: off-model, never the fetch render.
+      maybeNotifyClientUpdate(interaction)
       const sessionId = interaction.session_id ? String(interaction.session_id) : undefined
       return {
         content: [{ type: "text", text: formatFetchResults(interaction) }],
