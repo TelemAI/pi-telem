@@ -1,6 +1,6 @@
 {
   "name": "@telemai/pi-telem",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Telem web search and web fetch for the pi coding agent (extension + skill)",
   "type": "module",
   "keywords": [
