@@ -428,6 +428,13 @@ export function searchBlockFromConfig(env = process.env, projectRoot = undefined
   if (values.providerOverrides !== undefined) {
     block.provider_overrides = { ...values.providerOverrides }
   }
+  // The routing keys are env-only on purpose: they are not config-file options.
+  const autoRouting = env.TELEM_AUTO_ROUTING?.trim()
+  if (autoRouting) block.auto_routing = autoRouting
+  const count = env.TELEM_MAX_ROUTING_PROVIDERS
+  if (count !== undefined && /^\s*[+-]?\d+\s*$/.test(count)) block.max_routing_providers = Number(count)
+  const topic = env.TELEM_TOPIC?.trim()
+  if (topic) block.topic = topic
   return Object.keys(block).length ? block : null
 }
 
