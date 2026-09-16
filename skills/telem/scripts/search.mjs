@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Telem web search from the command line (see ./SKILL.md).
 //
-// Usage: search.mjs "query" ["another query" ...] [--goal "label"]
+// Usage: search.mjs "query" ["another query" ...] [--goal "label"] [--topic site]
 //
 // One invocation = one Telem interaction; multiple queries run concurrently
 // server-side and render as labelled sections. Credentials come from
@@ -16,7 +16,7 @@ import {
   searchBlockFromConfig,
 } from "./telem-common.mjs"
 
-export function buildSearchBody(queries, goal, env = process.env, projectRoot = process.cwd()) {
+export function buildSearchBody(queries, goal, env = process.env, projectRoot = process.cwd(), topic) {
   const cleaned = queries.map((q) => String(q).trim()).filter(Boolean)
   if (!cleaned.length) throw new Error("search requires at least one non-empty query.")
   const body = {
@@ -29,21 +29,27 @@ export function buildSearchBody(queries, goal, env = process.env, projectRoot = 
   if (goal) body.metadata.goal = goal
   // The project layer is the directory this script was run in — the same cwd the
   // agent is working in. Config warnings go to stderr; stdout stays results-only.
-  const search = searchBlockFromConfig(env, projectRoot)
+  const configured = searchBlockFromConfig(env, projectRoot)
+  // A --topic beats TELEM_TOPIC. The routing mode comes from the autoRouting config
+  // key or TELEM_AUTO_ROUTING, never from this flag.
+  const site = String(topic ?? "").trim()
+  const search = site ? { ...configured, topic: site } : configured
   if (search) body.search = search
   return body
 }
 
+/** Remove `name value` from args and return the value. */
+function takeFlag(args, name) {
+  const index = args.indexOf(name)
+  return index === -1 ? undefined : args.splice(index, 2)[1]
+}
+
 async function main() {
   const args = process.argv.slice(2)
-  let goal
-  const goalIndex = args.indexOf("--goal")
-  if (goalIndex !== -1) {
-    goal = args[goalIndex + 1]
-    args.splice(goalIndex, 2)
-  }
+  const goal = takeFlag(args, "--goal")
+  const topic = takeFlag(args, "--topic")
   if (!args.length) {
-    console.log('Usage: search.mjs "query" ["another query" ...] [--goal "label"]')
+    console.log('Usage: search.mjs "query" ["another query" ...] [--goal "label"] [--topic site]')
     console.log("\nCredentials (environment only):")
     console.log("  TELEM_BASE_URL              Telem deployment (default https://router.telem.ai)")
     console.log("  TELEM_API_KEY               Bearer token (omit for open deployments)")
@@ -54,7 +60,7 @@ async function main() {
     console.log("  providerOverrides           (file only; needs providersInclude)")
     process.exit(1)
   }
-  const interaction = await postInteraction(buildSearchBody(args, goal))
+  const interaction = await postInteraction(buildSearchBody(args, goal, process.env, process.cwd(), topic))
   assertV2Envelope(interaction)
   if (interaction.session_id) console.log(`Telem search session: ${interaction.session_id}\n`)
   console.log(formatSearchResults(interaction))

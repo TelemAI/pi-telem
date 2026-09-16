@@ -82,6 +82,7 @@ them in, and the deprecated `.pi/telem.json` files are extension-only.
 {baseDir}/scripts/search.mjs "query"                          # single query
 {baseDir}/scripts/search.mjs "query one" "query two"          # batch: one interaction, labelled sections
 {baseDir}/scripts/search.mjs "query" --goal "release research" # label this search in monitoring
+{baseDir}/scripts/search.mjs "query" --topic reddit            # one site only: linkedin, reddit or x (twitter)
 ```
 
 Batch related queries for the same step into ONE invocation — the backend runs

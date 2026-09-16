@@ -119,7 +119,11 @@ const TELEM_OPTIONS = [
   { key: "fullContent", coercion: "flag", env: "TELEM_FULL_CONTENT", envAliases: [] },
   // No env form on purpose: a JSON blob in a shell variable is not a config surface.
   { key: "providerOverrides", coercion: "overridesMap", env: null, envAliases: [] },
+  { key: "autoRouting", coercion: "name", env: "TELEM_AUTO_ROUTING", envAliases: [] },
 ]
+
+/** The one key whose env var outranks the files; every other key is file-beats-env. */
+const ENV_FIRST_KEYS = new Set(["autoRouting"])
 
 /** csv: items trimmed, empties dropped; all-empty is unset (env cannot say `[]`). */
 function csvValue(raw) {
@@ -252,7 +256,15 @@ export function resolveConfigOptions(env = process.env, projectRoot = undefined)
     const coerce = COERCERS[spec.coercion]
     let resolved
     let level
+    if (ENV_FIRST_KEYS.has(spec.key)) {
+      const fromEnvFirst = optionFromEnv(spec, env)
+      if (fromEnvFirst !== undefined) {
+        resolved = fromEnvFirst
+        level = "env"
+      }
+    }
     for (const layer of layers) {
+      if (level !== undefined) break
       // Own-property only: a key inherited from Object.prototype is not config.
       if (!layer.data || !Object.prototype.hasOwnProperty.call(layer.data, spec.key)) continue
       const candidate = coerce(layer.data[spec.key])
@@ -428,9 +440,9 @@ export function searchBlockFromConfig(env = process.env, projectRoot = undefined
   if (values.providerOverrides !== undefined) {
     block.provider_overrides = { ...values.providerOverrides }
   }
-  // The routing keys are env-only on purpose: they are not config-file options.
-  const autoRouting = env.TELEM_AUTO_ROUTING?.trim()
-  if (autoRouting) block.auto_routing = autoRouting
+  // autoRouting resolves like any other key (env beats the file for this one).
+  if (values.autoRouting !== undefined) block.auto_routing = values.autoRouting
+  // topic and the count stay env-only: they are not config-file options.
   const count = env.TELEM_MAX_ROUTING_PROVIDERS
   if (count !== undefined && /^\s*[+-]?\d+\s*$/.test(count)) block.max_routing_providers = Number(count)
   const topic = env.TELEM_TOPIC?.trim()
