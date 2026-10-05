@@ -294,6 +294,12 @@ export function resolveConfigOptions(env = process.env, projectRoot = undefined)
       sources[spec.key] = level
     }
   }
+  // config-core's dropAutoRoutingOff: "off" (any case) wins precedence like any
+  // value, then resolves to absent — the router answers 422 for it as a mode.
+  if (typeof values.autoRouting === "string" && values.autoRouting.toLowerCase() === "off") {
+    delete values.autoRouting
+    delete sources.autoRouting
+  }
 
   return { values, sources, warnings, telemDir: telemDir.dir }
 }
