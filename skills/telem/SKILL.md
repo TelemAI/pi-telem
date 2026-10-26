@@ -83,7 +83,15 @@ them in, and the deprecated `.pi/telem.json` files are extension-only.
 {baseDir}/scripts/search.mjs "query one" "query two"          # batch: one interaction, labelled sections
 {baseDir}/scripts/search.mjs "query" --goal "release research" # label this search in monitoring
 {baseDir}/scripts/search.mjs "query" --topic reddit            # one site only: linkedin, reddit or x (twitter)
+{baseDir}/scripts/search.mjs "query" --published-after 2026-10-01 # only results published on or after this date
+{baseDir}/scripts/search.mjs "query" --published-before 2026-10-15 # only results published before this date
 ```
+
+`--published-after` and `--published-before` take a date or date-time in ISO 8601
+(for example `2026-10-01` or `2026-10-01T09:00:00Z`); a value with no time zone is
+read as UTC, and a `--published-before` date with no time includes that whole day.
+Results with no known publication date are kept. Set them only when the task needs
+sources from a time period.
 
 Batch related queries for the same step into ONE invocation — the backend runs
 them concurrently as a single interaction.

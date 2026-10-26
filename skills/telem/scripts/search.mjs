@@ -2,6 +2,7 @@
 // Telem web search from the command line (see ./SKILL.md).
 //
 // Usage: search.mjs "query" ["another query" ...] [--goal "label"] [--topic site]
+//        [--published-after DATE] [--published-before DATE]
 //
 // One invocation = one Telem interaction; multiple queries run concurrently
 // server-side and render as labelled sections. Credentials come from
@@ -16,7 +17,7 @@ import {
   searchBlockFromConfig,
 } from "./telem-common.mjs"
 
-export function buildSearchBody(queries, goal, env = process.env, projectRoot = process.cwd(), topic) {
+export function buildSearchBody(queries, goal, env = process.env, projectRoot = process.cwd(), topic, window = {}) {
   const cleaned = queries.map((q) => String(q).trim()).filter(Boolean)
   if (!cleaned.length) throw new Error("search requires at least one non-empty query.")
   const body = {
@@ -31,9 +32,16 @@ export function buildSearchBody(queries, goal, env = process.env, projectRoot = 
   // agent is working in. Config warnings go to stderr; stdout stays results-only.
   const configured = searchBlockFromConfig(env, projectRoot)
   // A --topic beats TELEM_TOPIC. The routing mode comes from the autoRouting config
-  // key or TELEM_AUTO_ROUTING, never from this flag.
+  // key or TELEM_AUTO_ROUTING, never from this flag. The publication window, trimmed,
+  // rides on the same block (ISO 8601; the router validates it).
+  const perCall = {}
   const site = String(topic ?? "").trim()
-  const search = site ? { ...configured, topic: site } : configured
+  if (site) perCall.topic = site
+  for (const key of ["published_after", "published_before"]) {
+    const value = String(window[key] ?? "").trim()
+    if (value) perCall[key] = value
+  }
+  const search = Object.keys(perCall).length ? { ...configured, ...perCall } : configured
   if (search) body.search = search
   return body
 }
@@ -48,8 +56,13 @@ async function main() {
   const args = process.argv.slice(2)
   const goal = takeFlag(args, "--goal")
   const topic = takeFlag(args, "--topic")
+  const window = {
+    published_after: takeFlag(args, "--published-after"),
+    published_before: takeFlag(args, "--published-before"),
+  }
   if (!args.length) {
     console.log('Usage: search.mjs "query" ["another query" ...] [--goal "label"] [--topic site]')
+    console.log("                 [--published-after DATE] [--published-before DATE]")
     console.log("\nCredentials (environment only):")
     console.log("  TELEM_BASE_URL              Telem deployment (default https://router.telem.ai)")
     console.log("  TELEM_API_KEY               Bearer token (omit for open deployments)")
@@ -60,7 +73,7 @@ async function main() {
     console.log("  providerOverrides           (file only; needs providersInclude)")
     process.exit(1)
   }
-  const interaction = await postInteraction(buildSearchBody(args, goal, process.env, process.cwd(), topic))
+  const interaction = await postInteraction(buildSearchBody(args, goal, process.env, process.cwd(), topic, window))
   assertV2Envelope(interaction)
   if (interaction.session_id) console.log(`Telem search session: ${interaction.session_id}\n`)
   console.log(formatSearchResults(interaction))
