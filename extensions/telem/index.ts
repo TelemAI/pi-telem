@@ -273,6 +273,21 @@ function resolveTelemConfig(projectRoot: string | undefined, projectTrusted: boo
   return config
 }
 
+// The fetch `options` block (hosted-fetch-options spec F3): `fetchProviders` /
+// `fetchTier` / `fetchNoCache` become `providers` / `tier` / `no_cache`, in that key
+// order — or null when none resolved. It validates nothing: provider and tier names
+// are the router's to judge. Its one transformation is lowercasing `tier` (fetch
+// tiers are case-insensitive), and `no_cache` goes as resolved, so a file's `false`
+// is sent as `false`. The same block the vendored skill reader builds, pinned by the
+// shared the shared config contract corpus.
+function buildFetchOptions(options: TelemOptions): Record<string, unknown> | null {
+  const block: Record<string, unknown> = {}
+  if (options.fetchProviders !== undefined) block.providers = [...options.fetchProviders]
+  if (options.fetchTier !== undefined) block.tier = options.fetchTier.toLowerCase()
+  if (options.fetchNoCache !== undefined) block.no_cache = options.fetchNoCache
+  return Object.keys(block).length ? block : null
+}
+
 // The V2 `search` block, or null when nothing was configured — a body
 // without the block means "server defaults", which is the common case.
 // The two provider halves are forwarded exactly as configured: include REPLACES
@@ -1585,11 +1600,14 @@ export default function (pi: ExtensionAPI) {
       // body names NO pre/postprocessors — the backend assembles url_list +
       // web_fetch_cache itself. The search config is never attached here:
       // those knobs select SEARCH providers, and a `search` block on a fetch
-      // is a 400 — only the base url and key are shared.
+      // is a 400 — only the base url and key are shared. The
+      // fetch keys of the same config ride as the typed `options` block.
       const body: Record<string, unknown> = {
         urls,
         metadata,
       }
+      const fetchOptions = buildFetchOptions(config)
+      if (fetchOptions) body.options = fetchOptions
 
       const headers: Record<string, string> = { "Content-Type": "application/json" }
       if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`

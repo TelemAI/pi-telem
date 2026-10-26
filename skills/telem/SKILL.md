@@ -106,6 +106,11 @@ Options come from the config above; the environment is its lowest level. See
 {baseDir}/scripts/fetch.mjs https://a.com https://b.com https://c.com # up to 5 per call
 ```
 
+Fetch options come from the same config files, per key: `fetchProviders` /
+`TELEM_FETCH_PROVIDERS` pins the fetch providers (tried in that order),
+`fetchTier` / `TELEM_FETCH_TIER` picks the fetch tier, and `fetchNoCache` /
+`TELEM_FETCH_NO_CACHE=1` skips the shared cache. They apply to fetches only.
+
 Search returns snippets, never full pages; use `fetch.mjs` to read a page in
 depth. At most 5 URLs per call — for more pages, make several calls.
 
