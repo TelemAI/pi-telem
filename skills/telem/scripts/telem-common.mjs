@@ -337,25 +337,62 @@ function composeTierFields(values, sources, warnings) {
 }
 
 /**
+ * Thrown by the search block builder when the config can run no search:
+ * `providersExclude` removes every provider in `providersInclude`. The message
+ * says where each list was set. A caller refuses the search with it and sends
+ * nothing; running without the provider keys would search the deployment's
+ * default set, which can hold the provider the user excluded.
+ */
+export class ConfigRefusal extends Error {
+  constructor(message) {
+    super(message)
+    this.name = "ConfigRefusal"
+  }
+}
+
+/** Where a provider list was set, as the end of "set …" (config-core's `sourcePhrase`). */
+function sourcePhrase(key, level, telemDir, env) {
+  if (level === "project") return "in the project's .telem/telem.json"
+  if (level === "env") {
+    const spec = TELEM_OPTIONS.find((option) => option.key === key)
+    const names = [spec.env ?? key, ...spec.envAliases]
+    const name = names.find((n) => optionFromEnv({ ...spec, env: n, envAliases: [] }, env) !== undefined)
+    return `by ${name ?? names[0]}`
+  }
+  return `in ${join(telemDir, CONFIG_FILE_NAME)}`
+}
+
+/** The refusal sentence — config-core's `providersRefusal`, word for word. */
+function providersRefusal(include, inInclude, inExclude) {
+  const names = include.join(", ")
+  const fix =
+    inInclude === inExclude
+      ? `Remove ${names} from one of the two lists ${inInclude}.`
+      : `Remove ${names} from providersInclude (set ${inInclude}) or from providersExclude (set ${inExclude}).`
+  return (
+    `[telem] providersExclude removes every provider in providersInclude (${names}), ` +
+    `so no provider is left and no search was sent. ${fix}`
+  )
+}
+
+/**
  * When BOTH provider halves resolve, `exclude` is subtracted from `include` here
- * and only the subtracted `include` is sent.
+ * and only the subtracted `include` is sent: exclude wins.
  *
- * The server answers `include`/`exclude` naming the same provider with a 400, and
- * an `include` that resolves to nothing with a 400 as well — and both halves
- * resolving is ordinary, because they resolve per KEY (a user file's
+ * Both halves resolving is ordinary, because they resolve per KEY (a user file's
  * `providersExclude` meets a project file's `providersInclude`). `include`
  * REPLACES the deployment's default set, so it already names the whole candidate
  * set and "run these, minus those" is exactly `include \ exclude`.
  *
- * An emptied `include` drops BOTH halves: the config states an empty provider
- * set, so the deployment default runs — loudly — instead of every search failing.
+ * An emptied `include` REFUSES the search: both halves and `providerOverrides`
+ * leave `values`, and the refusal is returned for the search builder to throw.
  * A disjoint pair is silent (dropping a no-op is not news). `exclude` ALONE keeps
  * riding verbatim: only the server can enumerate the set it subtracts from.
  */
-function composeProviders(values, warnings) {
+function composeProviders(values, warnings, sourceOf) {
   const include = values.providersInclude
   const exclude = values.providersExclude
-  if (include === undefined || exclude === undefined) return
+  if (include === undefined || exclude === undefined) return undefined
 
   const excluded = new Set(exclude)
   const kept = include.filter((name) => !excluded.has(name))
@@ -364,22 +401,17 @@ function composeProviders(values, warnings) {
 
   if (kept.length) {
     values.providersInclude = kept
-    if (!dropped.length) return
-    warnings.push(
-      `[telem] providersExclude removes ${dropped.join(", ")} from providersInclude: ` +
-        `this search runs ${kept.join(", ")}. A request may not name the same provider in ` +
-        "both halves, so the exclusion is applied to the config and only providersInclude " +
-        "is sent.",
-    )
-    return
+    if (dropped.length) {
+      warnings.push(
+        `[telem] providersExclude removes ${dropped.join(", ")} from providersInclude: ` +
+          `this search runs ${kept.join(", ")}.`,
+      )
+    }
+    return undefined
   }
   delete values.providersInclude
-  warnings.push(
-    `[telem] providersExclude (${exclude.join(", ")}) removes every provider in ` +
-      `providersInclude (${include.join(", ")}): this config resolves to an EMPTY provider ` +
-      "set, which no search can run, so BOTH halves are dropped and the deployment's default " +
-      "provider set is running instead.",
-  )
+  delete values.providerOverrides
+  return providersRefusal(include, sourceOf("providersInclude"), sourceOf("providersExclude"))
 }
 
 /**
@@ -424,40 +456,47 @@ function guardProviderOverrides(values, warnings) {
 /**
  * Apply the three composition rules to a COPY of one resolution's values, so the
  * same resolution can still feed the fetch builder untouched. Returns the composed
- * values and ONLY the composition warnings — the reader's are the caller's to say.
+ * values, ONLY the composition warnings — the reader's are the caller's to say —
+ * and the refusal, when the config can run no search.
  */
-function composeSearchValues(resolved) {
+function composeSearchValues(resolved, env) {
   const values = { ...resolved.values }
   const warnings = []
   composeTierFields(values, resolved.sources, warnings)
-  composeProviders(values, warnings)
-  guardProviderOverrides(values, warnings)
-  return { values, warnings }
+  const refusal = composeProviders(values, warnings, (key) =>
+    sourcePhrase(key, resolved.sources[key], resolved.telemDir, env),
+  )
+  // A refused search sends no overrides, so the guard has nothing to say.
+  if (refusal === undefined) guardProviderOverrides(values, warnings)
+  return { values, warnings, refusal }
 }
 
 /**
  * The resolved options plus the composition rules, ready to render.
- * `{ values, sources, warnings }` — warnings are for STDERR, never for stdout,
- * which is what an agent reads as the search result.
+ * `{ values, sources, warnings, refusal? }` — warnings are for STDERR, never for
+ * stdout, which is what an agent reads as the search result.
  */
 export function resolveSkillOptions(env = process.env, projectRoot = undefined) {
   const resolved = resolveConfigOptions(env, projectRoot)
-  const composed = composeSearchValues(resolved)
+  const composed = composeSearchValues(resolved, env)
   return {
     ...resolved,
     values: composed.values,
     warnings: [...resolved.warnings, ...composed.warnings],
+    ...(composed.refusal === undefined ? {} : { refusal: composed.refusal }),
   }
 }
 
 /**
  * The SEARCH builder: the composition rules (their warnings through `warn`), the
  * env-only routing keys, and the V2 `search` block — or null when nothing is
- * configured (an absent block means "server defaults", the common case).
+ * configured (an absent block means "server defaults", the common case). Throws
+ * `ConfigRefusal` when the config can run no search.
  */
 function buildSearchBlock(resolved, env, warn) {
-  const { values, warnings } = composeSearchValues(resolved)
+  const { values, warnings, refusal } = composeSearchValues(resolved, env)
   for (const warning of warnings) warn(warning)
+  if (refusal !== undefined) throw new ConfigRefusal(refusal)
   const block = {}
   if (values.tier !== undefined) block.tier = values.tier
   if (values.fields !== undefined) block.fields = values.fields
@@ -509,11 +548,16 @@ function resolveAndWarn(env, projectRoot, warn) {
   return resolved
 }
 
-/** Run one builder so that its throw costs only its own block: null, plus one warning. */
+/**
+ * Run one builder so that its throw costs only its own block: null, plus one
+ * warning. A `ConfigRefusal` is not a failure to build: it propagates, because a
+ * null search block would run the default set.
+ */
 function buildIsolated(name, builder, resolved, env, warn) {
   try {
     return builder(resolved, env, warn)
   } catch (error) {
+    if (error instanceof ConfigRefusal) throw error
     warn(
       `[telem] ignoring the ${name} options in the Telem config: building them failed ` +
         `(${error?.message || String(error)}), so this call carries none.`,
@@ -526,7 +570,8 @@ function buildIsolated(name, builder, resolved, env, warn) {
  * Both blocks from ONE resolution: `{ search, fetch }`, each a block or null.
  *
  * - A RESOLUTION throw propagates: both blocks are lost, and the caller decides.
- * - A BUILDER throw costs only that builder's block — null, plus one warning.
+ * - A BUILDER throw costs only that builder's block — null, plus one warning —
+ *   except a `ConfigRefusal`, which propagates.
  * - The reader's warnings print once, before either builder runs; the search
  *   builder then prints its composition warnings, and the fetch builder none.
  *
@@ -549,8 +594,9 @@ export function blocksFromConfig(
 
 /**
  * The V2 `search` block alone: resolution plus the search builder, with NO catch —
- * a throw propagates (the pi skill's `search.mjs` exits non-zero on one). Warnings
- * go to stderr here — the caller gets a clean block.
+ * a throw propagates (the pi skill's `search.mjs` exits non-zero on one, a
+ * `ConfigRefusal` included). Warnings go to stderr here — the caller gets a clean
+ * block.
  */
 export function searchBlockFromConfig(env = process.env, projectRoot = undefined, warn = console.error) {
   return buildSearchBlock(resolveAndWarn(env, projectRoot, warn), env, warn)

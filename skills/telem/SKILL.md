@@ -62,10 +62,10 @@ Three rules are applied on top, in this order:
 1. A request may carry `tier` **or** `fields`, never both: the more specific
    level wins, and on a tie `fields` wins.
 2. When **both** `providersInclude` and `providersExclude` resolve, the exclusion
-   is subtracted from the include and only `providersInclude` is sent — the
-   server rejects a request naming the same provider in both halves. If that
-   leaves nothing, both halves are dropped and the deployment's default providers
-   run instead, so a config can never resolve to an empty provider set.
+   is subtracted from the include and only `providersInclude` is sent: exclude
+   wins. If that leaves nothing, the search is refused before anything is sent,
+   and the error says where each list was set; the default providers never run
+   instead, because they could include the one you excluded.
    `providersExclude` alone is forwarded untouched.
 3. `providerOverrides` applies only alongside the resolved `providersInclude`,
    and only to providers named there.
